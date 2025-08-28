@@ -1,2 +1,3 @@
-# payment-proxy
-Rinha de Backend 2025 payment proxy
+# load-balancer
+
+Load balancer system for the discipline of **Distributed Systems** - UNICAMP
