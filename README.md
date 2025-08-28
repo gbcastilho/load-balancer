@@ -1,3 +1,3 @@
 # load-balancer
 
-Load balancer system for the discipline of **Distributed Systems** - UNICAMP
+Load balancer system for the discipline **Distributed Systems** - UNICAMP
