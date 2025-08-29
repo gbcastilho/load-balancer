@@ -1,4 +1,6 @@
 use futures::future::join_all;
+use rand::Rng;
+use std::io::{self, Write};
 use std::sync::{Arc, RwLock};
 use tokio::time::{Duration, sleep};
 
@@ -23,17 +25,34 @@ impl Server {
 
 #[tokio::main]
 async fn main() {
-    let num_servers = 3;
+    print!("Number of servers: ");
+    io::stdout().flush().unwrap();
+
+    let mut input = String::new();
+    io::stdin()
+        .read_line(&mut input)
+        .expect("Failed to read input");
+
+    let num_servers: usize = match input.trim().parse() {
+        Ok(n) if n > 0 => n,
+        Ok(_) => 1,
+        Err(_) => {
+            println!("Invalid input, using 1 server");
+            1
+        }
+    };
+
     let counter = Arc::new(RwLock::new(10));
 
     println!("{} missing packages", counter.read().unwrap());
 
     let mut server_handles = Vec::with_capacity(num_servers);
+    let mut rng = rand::rng();
 
     for i in 0..num_servers {
         let server = Server {
             id: (i as u64) + 1,
-            speed: ((i as u64) + 1) * 1000,
+            speed: rng.random_range(1000..=5000),
         };
 
         let counter_clone = Arc::clone(&counter);
@@ -59,7 +78,7 @@ async fn main() {
             break;
         }
         drop(counter_guard);
-        let _ = sleep(Duration::from_millis(100));
+        let _ = sleep(Duration::from_millis(100)).await;
     }
 
     let _ = join_all(server_handles).await;
