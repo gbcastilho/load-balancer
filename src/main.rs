@@ -1,4 +1,5 @@
-use std::sync::{Arc, Mutex};
+use futures::future::join_all;
+use std::sync::{Arc, RwLock};
 use tokio::time::{Duration, sleep};
 
 #[derive(Debug)]
@@ -22,50 +23,44 @@ impl Server {
 
 #[tokio::main]
 async fn main() {
-    let server1 = Server { id: 1, speed: 2000 };
-    let server2 = Server { id: 2, speed: 1000 };
-    let server3 = Server { id: 2, speed: 3000 };
+    let num_servers = 3;
+    let counter = Arc::new(RwLock::new(10));
 
-    let counter = Arc::new(Mutex::new(10));
+    println!("{} missing packages", counter.read().unwrap());
 
-    let counter_clone1 = Arc::clone(&counter);
-    let counter_clone2 = Arc::clone(&counter);
-    let counter_clone3 = Arc::clone(&counter);
+    let mut server_handles = Vec::with_capacity(num_servers);
 
-    let server1_handle = tokio::spawn(async move {
-        loop {
-            server1.process_package().await;
-            let mut counter_guard = counter_clone1.lock().unwrap();
-            *counter_guard -= 1;
-            println!("{counter_guard} missing packages");
-        }
-    });
-    let server2_handle = tokio::spawn(async move {
-        loop {
-            server2.process_package().await;
-            let mut counter_guard = counter_clone2.lock().unwrap();
-            *counter_guard -= 1;
-            println!("{counter_guard} missing packages");
-        }
-    });
-    let server3_handle = tokio::spawn(async move {
-        loop {
-            server3.process_package().await;
-            let mut counter_guard = counter_clone3.lock().unwrap();
-            *counter_guard -= 1;
-            println!("{counter_guard} missing packages");
-        }
-    });
+    for i in 0..num_servers {
+        let server = Server {
+            id: (i as u64) + 1,
+            speed: ((i as u64) + 1) * 1000,
+        };
 
-    loop {
-        let counter_guard = counter.lock().unwrap();
-        if *counter_guard <= 0 {
-            server1_handle.abort();
-            server2_handle.abort();
-            server3_handle.abort();
-            break;
-        }
+        let counter_clone = Arc::clone(&counter);
+
+        let handle = tokio::spawn(async move {
+            loop {
+                server.process_package().await;
+                let mut counter_guard = counter_clone.write().unwrap();
+                *counter_guard -= 1;
+                println!("{counter_guard} missing packages");
+            }
+        });
+
+        server_handles.push(handle);
     }
 
-    let _ = tokio::join!(server1_handle, server2_handle, server3_handle);
+    loop {
+        let counter_guard = counter.read().unwrap();
+        if *counter_guard <= 0 {
+            for handle in &server_handles {
+                handle.abort();
+            }
+            break;
+        }
+        drop(counter_guard);
+        let _ = sleep(Duration::from_millis(100));
+    }
+
+    let _ = join_all(server_handles).await;
 }
