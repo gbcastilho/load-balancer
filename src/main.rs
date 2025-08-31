@@ -1,48 +1,14 @@
+mod entities;
+
 use crossterm::{ExecutableCommand, cursor, terminal};
+use entities::{Request, Server};
 use futures::future::join_all;
-use rand::Rng;
-use std::io::{self, Write};
-use std::sync::{Arc, RwLock};
-use tokio::time::{Duration, sleep};
-
-#[derive(Debug)]
-pub struct Server {
-    id: u64,
-    speed: u64,
-}
-
-impl Server {
-    async fn process_package(&self) {
-        let timeout_ms = self.speed.max(1);
-
-        sleep(Duration::from_millis(timeout_ms)).await;
-
-        // println!(
-        //     "Server {} finished after {} milliseconds",
-        //     self.id, self.speed
-        // );
-    }
-}
-
-fn print_progress_bar(current: usize, total: usize) {
-    let bar_width = 50;
-    let progress = (bar_width as f64 * (total - current) as f64 / total as f64) as usize;
-
-    let mut bar = String::with_capacity(bar_width + 2);
-    bar.push('[');
-    for i in 0..bar_width {
-        if i < progress {
-            bar.push('#');
-        } else {
-            bar.push('-');
-        }
-    }
-    bar.push(']');
-
-    reset_line();
-    print!("{} {}/{}", bar, total - current, total);
-    io::stdout().flush().unwrap();
-}
+use rand::{Rng, SeedableRng};
+use std::collections::VecDeque;
+use std::io;
+use std::sync::Arc;
+use tokio::sync::RwLock;
+use tokio::time::{Duration, interval};
 
 fn reset_line() {
     let mut stdout = io::stdout();
@@ -52,68 +18,132 @@ fn reset_line() {
 
 #[tokio::main]
 async fn main() {
-    print!("Number of servers: ");
-    io::stdout().flush().unwrap();
+    let avg_rate = 30;
+    let mut choice_mode = ServerChoiceMode::Random;
 
-    let mut input = String::new();
-    io::stdin()
-        .read_line(&mut input)
-        .expect("Failed to read input");
+    let requests_queue = Arc::new(RwLock::new(VecDeque::new()));
+    let req_emit_queue = Arc::clone(&requests_queue);
 
-    let num_servers: usize = match input.trim().parse() {
-        Ok(n) if n > 0 => n,
-        Ok(_) => 1,
-        Err(_) => {
-            println!("Invalid input, using 1 server");
-            1
+    let req_emit_handle = tokio::spawn(async move {
+        check_n_emit_request(avg_rate, req_emit_queue).await;
+    });
+
+    let servers = Arc::new([
+        Arc::new(RwLock::new(Server {
+            id: 1,
+            queue: VecDeque::with_capacity(10),
+        })),
+        Arc::new(RwLock::new(Server {
+            id: 2,
+            queue: VecDeque::with_capacity(10),
+        })),
+        Arc::new(RwLock::new(Server {
+            id: 3,
+            queue: VecDeque::with_capacity(10),
+        })),
+    ]);
+
+    let servers_for_alloc = Arc::clone(&servers);
+    let alloc_server_handle = tokio::spawn(async move {
+        loop {
+            alloc_req_to_server(&servers_for_alloc, &mut choice_mode, &requests_queue).await;
         }
-    };
+    });
 
-    let total_packages = 10;
-    let counter = Arc::new(RwLock::new(total_packages));
-
-    let mut server_handles = Vec::with_capacity(num_servers);
-    let mut rng = rand::rng();
-
-    for i in 0..num_servers {
-        let server = Server {
-            id: (i as u64) + 1,
-            speed: rng.random_range(1000..=5000),
-        };
-
-        let counter_clone = Arc::clone(&counter);
-
-        let handle = tokio::spawn(async move {
-            loop {
-                server.process_package().await;
-                let mut counter_guard = counter_clone.write().unwrap();
-                *counter_guard -= 1;
-
-                reset_line();
-                println!("Server {} processed package", server.id);
-
-                if *counter_guard <= 0 {
-                    break;
-                }
-            }
-        });
-
-        server_handles.push(handle);
+    let mut server_handles = Vec::with_capacity(5);
+    for server in servers.iter() {
+        let server_clone = Arc::clone(server);
+        server_handles.push(tokio::spawn(async move {
+            let mut server_guard = server_clone.write().await;
+            server_guard.process_request().await;
+        }))
     }
 
-    loop {
-        let counter_guard = counter.read().unwrap();
-        print_progress_bar(*counter_guard, total_packages);
-        if *counter_guard <= 0 {
-            for handle in &server_handles {
-                handle.abort();
-            }
-            break;
-        }
-        drop(counter_guard);
-        let _ = sleep(Duration::from_millis(100)).await;
-    }
+    server_handles.push(req_emit_handle);
+    server_handles.push(alloc_server_handle);
 
     let _ = join_all(server_handles).await;
-    println!();
+}
+
+async fn check_n_emit_request(avg_rate: usize, req_queue: Arc<RwLock<VecDeque<Request>>>) {
+    let mut rng = rand::rngs::StdRng::from_rng(&mut rand::rng());
+
+    let mut ticker = interval(Duration::from_millis(10));
+    loop {
+        ticker.tick().await;
+        let lottery_number = rng.random_range(0..1000);
+        if lottery_number < (avg_rate / 100) {
+            let new_req = Request::create_random();
+
+            let mut req_queue_guard = req_queue.write().await;
+            req_queue_guard.push_back(new_req);
+        }
+    }
+}
+
+enum ServerChoiceMode {
+    Random,
+    RoundRobin { server_num: usize },
+    SmallerQueue,
+}
+
+impl ServerChoiceMode {
+    async fn choose(
+        servers: &[Arc<RwLock<Server>>; 3],
+        choice_mode: &mut ServerChoiceMode,
+        request: Request,
+    ) {
+        let mut rng = rand::rngs::StdRng::from_rng(&mut rand::rng());
+
+        let chosen_idx = match choice_mode {
+            ServerChoiceMode::Random => rng.random_range(0..servers.len()),
+            ServerChoiceMode::RoundRobin { server_num } => {
+                let idx = *server_num;
+
+                *server_num = (idx + 1) % servers.len();
+                idx
+            }
+            ServerChoiceMode::SmallerQueue => {
+                let mut server_workloads = Vec::with_capacity(servers.len());
+                for (idx, server) in servers.iter().enumerate() {
+                    let server_guard = server.read().await;
+                    let workload = server_guard
+                        .queue
+                        .iter()
+                        .map(|req| req.get_time())
+                        .sum::<u64>();
+
+                    server_workloads.push((idx, workload));
+                }
+
+                server_workloads
+                    .iter()
+                    .min_by_key(|(_, workload)| workload)
+                    .map(|(idx, _)| *idx)
+                    .unwrap_or(0)
+            }
+        };
+
+        let mut server_guard = servers[chosen_idx].write().await;
+        server_guard.queue.push_back(request);
+    }
+}
+
+async fn alloc_req_to_server(
+    servers: &[Arc<RwLock<Server>>; 3],
+    choice_mode: &mut ServerChoiceMode,
+    req_queue: &Arc<RwLock<VecDeque<Request>>>,
+) {
+    let mut ticker = interval(Duration::from_millis(10));
+
+    loop {
+        ticker.tick().await;
+        let mut req_queue_guard = req_queue.write().await;
+        let request = match req_queue_guard.pop_front() {
+            Some(req) => req,
+            None => return,
+        };
+
+        let _ = ServerChoiceMode::choose(servers, choice_mode, request).await;
+    }
 }
