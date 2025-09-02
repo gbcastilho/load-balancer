@@ -54,8 +54,13 @@ async fn main() {
     for server in servers.iter() {
         let server_clone = Arc::clone(server);
         server_handles.push(tokio::spawn(async move {
-            let mut server_guard = server_clone.write().await;
-            server_guard.process_request().await;
+            let mut ticker = interval(Duration::from_millis(10));
+
+            loop {
+                ticker.tick().await;
+                let mut server_guard = server_clone.write().await;
+                server_guard.process_request().await;
+            }
         }))
     }
 
