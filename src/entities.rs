@@ -93,6 +93,7 @@ impl Server {
     pub async fn process_request(&mut self) {
         if let Some(request) = self.queue.pop_front() {
             sleep(Duration::from_millis(request.get_time())).await;
+            println!("Server {} processed request {}", self.id, request.id);
         }
     }
 }

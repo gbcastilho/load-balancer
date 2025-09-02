@@ -74,6 +74,7 @@ async fn check_n_emit_request(avg_rate: usize, req_queue: Arc<RwLock<VecDeque<Re
         let lottery_number = rng.random_range(0..1000);
         if lottery_number < (avg_rate / 100) {
             let new_req = Request::create_random();
+            println!("Request {} arrived", new_req.id);
 
             let mut req_queue_guard = req_queue.write().await;
             req_queue_guard.push_back(new_req);
