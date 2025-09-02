@@ -18,7 +18,7 @@ fn reset_line() {
 
 #[tokio::main]
 async fn main() {
-    let avg_rate = 30;
+    let avg_rate = 300;
     let mut choice_mode = ServerChoiceMode::Random;
 
     let requests_queue = Arc::new(RwLock::new(VecDeque::new()));
@@ -134,7 +134,7 @@ async fn alloc_req_to_server(
     choice_mode: &mut ServerChoiceMode,
     req_queue: &Arc<RwLock<VecDeque<Request>>>,
 ) {
-    let mut ticker = interval(Duration::from_millis(10));
+    let mut ticker = interval(Duration::from_millis(3000));
 
     loop {
         ticker.tick().await;
