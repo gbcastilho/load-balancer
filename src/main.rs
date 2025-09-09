@@ -1,20 +1,12 @@
 mod entities;
 
-use crossterm::{ExecutableCommand, cursor, terminal};
 use entities::{Request, Server};
 use futures::future::join_all;
 use rand::{Rng, SeedableRng};
 use std::collections::VecDeque;
-use std::io;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::time::{Duration, interval};
-
-fn reset_line() {
-    let mut stdout = io::stdout();
-    let _ = stdout.execute(cursor::MoveToColumn(0));
-    let _ = stdout.execute(terminal::Clear(terminal::ClearType::CurrentLine));
-}
 
 #[tokio::main]
 async fn main() {
