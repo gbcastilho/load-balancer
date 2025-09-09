@@ -50,10 +50,10 @@ async fn main() {
         }
     });
 
-    let mut server_handles = Vec::with_capacity(5);
+    let mut loop_handles = Vec::with_capacity(5);
     for server in servers.iter() {
         let server_clone = Arc::clone(server);
-        server_handles.push(tokio::spawn(async move {
+        loop_handles.push(tokio::spawn(async move {
             let mut ticker = interval(Duration::from_millis(10));
 
             loop {
@@ -64,10 +64,10 @@ async fn main() {
         }))
     }
 
-    server_handles.push(req_emit_handle);
-    server_handles.push(alloc_server_handle);
+    loop_handles.push(req_emit_handle);
+    loop_handles.push(alloc_server_handle);
 
-    let _ = join_all(server_handles).await;
+    let _ = join_all(loop_handles).await;
 }
 
 async fn check_n_emit_request(avg_rate: usize, req_queue: Arc<RwLock<VecDeque<Request>>>) {
