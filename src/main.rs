@@ -1,7 +1,8 @@
+mod display;
 mod entities;
 
+use display::draw;
 use entities::{Request, Server};
-use futures::future::join_all;
 use rand::{Rng, SeedableRng};
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -10,13 +11,14 @@ use tokio::time::{Duration, interval};
 
 #[tokio::main]
 async fn main() {
-    let avg_rate = 300;
+    let avg_rate = 500;
     let mut choice_mode = ServerChoiceMode::Random;
 
     let requests_queue = Arc::new(RwLock::new(VecDeque::new()));
     let req_emit_queue = Arc::clone(&requests_queue);
+    let req_draw_queue = Arc::clone(&requests_queue);
 
-    let req_emit_handle = tokio::spawn(async move {
+    let _ = tokio::spawn(async move {
         check_n_emit_request(avg_rate, req_emit_queue).await;
     });
 
@@ -36,7 +38,7 @@ async fn main() {
     ]);
 
     let servers_for_alloc = Arc::clone(&servers);
-    let alloc_server_handle = tokio::spawn(async move {
+    let _ = tokio::spawn(async move {
         loop {
             alloc_req_to_server(&servers_for_alloc, &mut choice_mode, &requests_queue).await;
         }
@@ -56,10 +58,11 @@ async fn main() {
         }))
     }
 
-    loop_handles.push(req_emit_handle);
-    loop_handles.push(alloc_server_handle);
+    let draw_handle = tokio::task::spawn_blocking(move || {
+        let _ = draw(req_draw_queue);
+    });
 
-    let _ = join_all(loop_handles).await;
+    let _ = draw_handle.await;
 }
 
 async fn check_n_emit_request(avg_rate: usize, req_queue: Arc<RwLock<VecDeque<Request>>>) {
@@ -71,7 +74,6 @@ async fn check_n_emit_request(avg_rate: usize, req_queue: Arc<RwLock<VecDeque<Re
         let lottery_number = rng.random_range(0..1000);
         if lottery_number < (avg_rate / 100) {
             let new_req = Request::create_random();
-            println!("Request {} arrived", new_req.id);
 
             let mut req_queue_guard = req_queue.write().await;
             req_queue_guard.push_back(new_req);
