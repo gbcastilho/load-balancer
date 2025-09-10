@@ -3,6 +3,8 @@ use std::{fmt::Debug, time::Duration};
 use rand::Rng;
 use tokio::time::{self, sleep};
 
+use crate::display::log_debug;
+
 #[derive(Debug, Clone, Copy)]
 pub enum RequestSize {
     Small,
@@ -93,6 +95,7 @@ impl Server {
     pub async fn process_request(&mut self) {
         if let Some(request) = self.queue.pop_front() {
             sleep(Duration::from_millis(request.get_time())).await;
+            log_debug(format!("Server {} processed #{}", self.id, request.id));
         }
     }
 }

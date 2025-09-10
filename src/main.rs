@@ -9,9 +9,11 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::time::{Duration, interval};
 
+use crate::display::log_debug;
+
 #[tokio::main]
 async fn main() {
-    let avg_rate = 500;
+    let avg_rate = 5000;
     let mut choice_mode = ServerChoiceMode::Random;
 
     let requests_queue = Arc::new(RwLock::new(VecDeque::new()));
@@ -38,6 +40,8 @@ async fn main() {
     ]);
 
     let servers_for_alloc = Arc::clone(&servers);
+    let draw_servers = Arc::clone(&servers);
+
     let _ = tokio::spawn(async move {
         loop {
             alloc_req_to_server(&servers_for_alloc, &mut choice_mode, &requests_queue).await;
@@ -59,7 +63,7 @@ async fn main() {
     }
 
     let draw_handle = tokio::task::spawn_blocking(move || {
-        let _ = draw(req_draw_queue);
+        let _ = draw(req_draw_queue, draw_servers);
     });
 
     let _ = draw_handle.await;
@@ -76,6 +80,7 @@ async fn check_n_emit_request(avg_rate: usize, req_queue: Arc<RwLock<VecDeque<Re
             let new_req = Request::create_random();
 
             let mut req_queue_guard = req_queue.write().await;
+            log_debug(format!("Request #{} arrived", new_req.id));
             req_queue_guard.push_back(new_req);
         }
     }
@@ -125,6 +130,10 @@ impl ServerChoiceMode {
         };
 
         let mut server_guard = servers[chosen_idx].write().await;
+        log_debug(format!(
+            "Server {} received #{}",
+            server_guard.id, request.id
+        ));
         server_guard.queue.push_back(request);
     }
 }
@@ -134,7 +143,7 @@ async fn alloc_req_to_server(
     choice_mode: &mut ServerChoiceMode,
     req_queue: &Arc<RwLock<VecDeque<Request>>>,
 ) {
-    let mut ticker = interval(Duration::from_millis(3000));
+    let mut ticker = interval(Duration::from_millis(50));
 
     loop {
         ticker.tick().await;
