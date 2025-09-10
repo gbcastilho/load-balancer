@@ -6,7 +6,7 @@ use tokio::time::{self, sleep};
 #[derive(Debug, Clone, Copy)]
 pub enum RequestSize {
     Small,
-    Medium,
+    Mid,
     Large,
 }
 
@@ -14,7 +14,7 @@ impl RequestSize {
     fn mult_factor(&self) -> u64 {
         match self {
             RequestSize::Small => 5,
-            RequestSize::Medium => 10,
+            RequestSize::Mid => 10,
             RequestSize::Large => 50,
         }
     }
@@ -22,7 +22,7 @@ impl RequestSize {
 
 #[derive(Debug, Clone, Copy)]
 pub enum RequestType {
-    CPUBound,
+    CPUsBound,
     IOBound,
     Mixed,
 }
@@ -30,7 +30,7 @@ pub enum RequestType {
 impl RequestType {
     fn cpu_time(&self) -> u64 {
         match self {
-            RequestType::CPUBound => 95,
+            RequestType::CPUsBound => 95,
             RequestType::IOBound => 30,
             RequestType::Mixed => 55,
         }
@@ -38,7 +38,7 @@ impl RequestType {
 
     fn io_time(&self) -> u64 {
         match self {
-            RequestType::CPUBound => 5,
+            RequestType::CPUsBound => 5,
             RequestType::IOBound => 70,
             RequestType::Mixed => 45,
         }
@@ -67,12 +67,12 @@ impl Request {
         let mut rng = rand::rng();
 
         const REQ_TYPES: [RequestType; 3] = [
-            RequestType::CPUBound,
+            RequestType::CPUsBound,
             RequestType::IOBound,
             RequestType::Mixed,
         ];
         const REQ_SIZES: [RequestSize; 3] =
-            [RequestSize::Small, RequestSize::Medium, RequestSize::Large];
+            [RequestSize::Small, RequestSize::Mid, RequestSize::Large];
 
         Self {
             id: rng.random_range(1000000..10000000),

@@ -38,7 +38,7 @@ fn render_req_widget(frame: &mut Frame, area: Rect, req_queue: &Arc<RwLock<VecDe
         let [req_line, _] = vert_layout.areas(inner_area);
 
         let req_layout =
-            Layout::horizontal(vec![Constraint::Max(20); req_queue_guard.len()]).split(req_line);
+            Layout::horizontal(vec![Constraint::Max(21); req_queue_guard.len()]).split(req_line);
 
         for (idx, request) in req_queue_guard.iter().enumerate() {
             let req_block = Block::bordered();
