@@ -1,90 +1,16 @@
 mod display;
-mod entities;
+mod request;
+mod server;
 
-use display::draw;
-use entities::{Request, Server};
 use rand::{Rng, SeedableRng};
+use request::Request;
 use std::collections::VecDeque;
-use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::mpsc::{self, Receiver, Sender};
+use tokio::task::JoinHandle;
 use tokio::time::{Duration, interval};
 
-use crate::display::log_debug;
-
-#[tokio::main]
-async fn main() {
-    let avg_rate = 5000;
-    let mut choice_mode = ServerChoiceMode::Random;
-
-    let requests_queue = Arc::new(RwLock::new(VecDeque::new()));
-    let req_emit_queue = Arc::clone(&requests_queue);
-    let req_draw_queue = Arc::clone(&requests_queue);
-
-    let _ = tokio::spawn(async move {
-        check_n_emit_request(avg_rate, req_emit_queue).await;
-    });
-
-    let servers = Arc::new([
-        Arc::new(RwLock::new(Server {
-            id: 1,
-            queue: VecDeque::with_capacity(10),
-        })),
-        Arc::new(RwLock::new(Server {
-            id: 2,
-            queue: VecDeque::with_capacity(10),
-        })),
-        Arc::new(RwLock::new(Server {
-            id: 3,
-            queue: VecDeque::with_capacity(10),
-        })),
-    ]);
-
-    let servers_for_alloc = Arc::clone(&servers);
-    let draw_servers = Arc::clone(&servers);
-
-    let _ = tokio::spawn(async move {
-        loop {
-            alloc_req_to_server(&servers_for_alloc, &mut choice_mode, &requests_queue).await;
-        }
-    });
-
-    let mut loop_handles = Vec::with_capacity(5);
-    for server in servers.iter() {
-        let server_clone = Arc::clone(server);
-        loop_handles.push(tokio::spawn(async move {
-            let mut ticker = interval(Duration::from_millis(10));
-
-            loop {
-                ticker.tick().await;
-                let mut server_guard = server_clone.write().await;
-                server_guard.process_request().await;
-            }
-        }))
-    }
-
-    let draw_handle = tokio::task::spawn_blocking(move || {
-        let _ = draw(req_draw_queue, draw_servers);
-    });
-
-    let _ = draw_handle.await;
-}
-
-async fn check_n_emit_request(avg_rate: usize, req_queue: Arc<RwLock<VecDeque<Request>>>) {
-    let mut rng = rand::rngs::StdRng::from_rng(&mut rand::rng());
-
-    let mut ticker = interval(Duration::from_millis(10));
-    loop {
-        ticker.tick().await;
-        let lottery_number = rng.random_range(0..1000);
-        if lottery_number < (avg_rate / 100) {
-            let new_req = Request::create_random();
-
-            let mut req_queue_guard = req_queue.write().await;
-            log_debug(format!("Request #{} arrived", new_req.id));
-            req_queue_guard.push_back(new_req);
-        }
-    }
-}
+use crate::display::run_ui;
+use crate::server::ServerState;
 
 enum ServerChoiceMode {
     Random,
@@ -92,67 +18,244 @@ enum ServerChoiceMode {
     SmallerQueue,
 }
 
-impl ServerChoiceMode {
-    async fn choose(
-        servers: &[Arc<RwLock<Server>>; 3],
-        choice_mode: &mut ServerChoiceMode,
-        request: Request,
-    ) {
-        let mut rng = rand::rngs::StdRng::from_rng(&mut rand::rng());
-
-        let chosen_idx = match choice_mode {
-            ServerChoiceMode::Random => rng.random_range(0..servers.len()),
-            ServerChoiceMode::RoundRobin { server_num } => {
-                let idx = *server_num;
-
-                *server_num = (idx + 1) % servers.len();
-                idx
-            }
-            ServerChoiceMode::SmallerQueue => {
-                let mut server_workloads = Vec::with_capacity(servers.len());
-                for (idx, server) in servers.iter().enumerate() {
-                    let server_guard = server.read().await;
-                    let workload = server_guard
-                        .queue
-                        .iter()
-                        .map(|req| req.get_time())
-                        .sum::<u64>();
-
-                    server_workloads.push((idx, workload));
-                }
-
-                server_workloads
-                    .iter()
-                    .min_by_key(|(_, workload)| workload)
-                    .map(|(idx, _)| *idx)
-                    .unwrap_or(0)
-            }
-        };
-
-        let mut server_guard = servers[chosen_idx].write().await;
-        log_debug(format!(
-            "Server {} received #{}",
-            server_guard.id, request.id
-        ));
-        server_guard.queue.push_back(request);
-    }
+#[derive(Clone, Copy)]
+enum SystemEvent {
+    RequestCreated(Request),
+    RequestAssigned { server_id: u64, request: Request },
+    RequestProcessed { request_id: usize, server_id: u64 },
 }
 
-async fn alloc_req_to_server(
-    servers: &[Arc<RwLock<Server>>; 3],
-    choice_mode: &mut ServerChoiceMode,
-    req_queue: &Arc<RwLock<VecDeque<Request>>>,
-) {
-    let mut ticker = interval(Duration::from_millis(50));
+pub struct SystemState {
+    pending_requests: VecDeque<Request>,
+    servers: [ServerState; 3],
+    logs: Vec<String>,
+    stats: SystemStats,
+}
 
-    loop {
-        ticker.tick().await;
-        let mut req_queue_guard = req_queue.write().await;
-        let request = match req_queue_guard.pop_front() {
-            Some(req) => req,
-            None => return,
-        };
+pub struct SystemStats {
+    total_requests: usize,
+    processed_requests: usize,
+    avg_wait_time: f64,
+}
 
-        let _ = ServerChoiceMode::choose(servers, choice_mode, request).await;
-    }
+const REQUEST_AVG_RATE: i32 = 3; // requests/second
+
+#[tokio::main]
+async fn main() {
+    let (main_tx, main_rx) = mpsc::channel::<SystemEvent>(100);
+
+    let (allocator_tx, allocator_rx) = mpsc::channel::<SystemEvent>(100);
+    let (server_tx, server_rx) = mpsc::channel::<SystemEvent>(100);
+    let (ui_tx, ui_rx) = mpsc::channel::<SystemEvent>(100);
+
+    let router_handle = spawn_event_router(main_rx, allocator_tx, server_tx, ui_tx);
+
+    let gen_handle = spawn_request_generator(main_tx.clone());
+    let alloc_handle = spawn_request_allocator(main_tx.clone(), allocator_rx);
+    let server_handle = spawn_servers(main_tx.clone(), server_rx);
+
+    let ui_handle = tokio::task::spawn_blocking(move || {
+        if let Err(e) = run_ui(ui_rx) {
+            eprintln!("UI error: {}", e);
+        }
+    });
+
+    ui_handle.await.unwrap();
+
+    router_handle.abort();
+    gen_handle.abort();
+    alloc_handle.abort();
+    server_handle.abort();
+}
+
+fn spawn_event_router(
+    mut event_rx: Receiver<SystemEvent>,
+    allocator_tx: Sender<SystemEvent>,
+    server_tx: Sender<SystemEvent>,
+    ui_tx: Sender<SystemEvent>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(event) = event_rx.recv().await {
+            match event {
+                SystemEvent::RequestCreated(_) => {
+                    allocator_tx.send(event.clone()).await.ok();
+
+                    ui_tx.send(event).await.ok();
+                }
+                SystemEvent::RequestAssigned { .. } => {
+                    server_tx.send(event.clone()).await.ok();
+
+                    ui_tx.send(event).await.ok();
+                }
+                SystemEvent::RequestProcessed { .. } => {
+                    allocator_tx.send(event.clone()).await.ok();
+                    server_tx.send(event.clone()).await.ok();
+
+                    ui_tx.send(event).await.ok();
+                }
+            }
+        }
+    })
+}
+
+fn spawn_request_generator(event_tx: Sender<SystemEvent>) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut rng = rand::rngs::StdRng::from_rng(&mut rand::rng());
+        let mut ticker = interval(Duration::from_millis(100));
+
+        loop {
+            if rng.random_range(0..10) < REQUEST_AVG_RATE {
+                let request = Request::create_random();
+
+                event_tx
+                    .send(SystemEvent::RequestCreated(request.clone()))
+                    .await
+                    .ok();
+            }
+
+            ticker.tick().await;
+        }
+    })
+}
+
+fn spawn_request_allocator(
+    event_tx: Sender<SystemEvent>,
+    mut event_rx: Receiver<SystemEvent>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut server_states = [
+            ServerState::new(1),
+            ServerState::new(2),
+            ServerState::new(3),
+        ];
+        let mut requests = VecDeque::new();
+        let mut choice_mode = ServerChoiceMode::Random;
+        let mut ticker = interval(Duration::from_millis(50));
+
+        let mut rng = rand::rngs::StdRng::from_rng(&mut rand::rng());
+
+        loop {
+            while let Ok(event) = event_rx.try_recv() {
+                match event {
+                    SystemEvent::RequestCreated(request) => {
+                        requests.push_back(request);
+                    }
+                    SystemEvent::RequestProcessed {
+                        request_id: _,
+                        server_id,
+                    } => {
+                        let server_idx = (server_id - 1) as usize;
+
+                        server_states[server_idx].remove_request();
+                        server_states[server_idx].is_processing = false;
+                    }
+                    _ => {}
+                }
+            }
+
+            if !requests.is_empty() {
+                let server_idx = match choice_mode {
+                    ServerChoiceMode::Random => rng.random_range(0..3),
+                    ServerChoiceMode::RoundRobin { ref mut server_num } => {
+                        let idx = *server_num;
+                        *server_num = (*server_num + 1) % 3;
+                        idx
+                    }
+                    ServerChoiceMode::SmallerQueue => server_states
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|(_, state)| state.total_workload)
+                        .map(|(idx, _)| idx)
+                        .unwrap_or(0),
+                };
+
+                let server = &mut server_states[server_idx];
+
+                if server.queue.len() >= server.queue.capacity() {
+                    continue;
+                }
+
+                let request = requests.pop_front().unwrap();
+
+                server.add_request(request.clone());
+
+                event_tx
+                    .send(SystemEvent::RequestAssigned {
+                        server_id: server.id,
+                        request: request,
+                    })
+                    .await
+                    .ok();
+            }
+
+            ticker.tick().await;
+        }
+    })
+}
+
+fn spawn_servers(
+    event_tx: Sender<SystemEvent>,
+    mut event_rx: Receiver<SystemEvent>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut servers = [
+            ServerState::new(1),
+            ServerState::new(2),
+            ServerState::new(3),
+        ];
+
+        let mut ticker = interval(Duration::from_millis(10));
+
+        loop {
+            while let Ok(event) = event_rx.try_recv() {
+                match event {
+                    SystemEvent::RequestAssigned { server_id, request } => {
+                        let server_idx = (server_id - 1) as usize;
+                        if server_idx < servers.len() {
+                            let server = &mut servers[server_idx];
+
+                            server.add_request(request);
+                        }
+                    }
+                    SystemEvent::RequestProcessed {
+                        request_id: _,
+                        server_id,
+                    } => {
+                        let server_idx = (server_id - 1) as usize;
+                        if server_idx < servers.len() {
+                            let server = &mut servers[server_idx];
+
+                            server.is_processing = false;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            for server in &mut servers {
+                if !server.queue.is_empty() && !server.is_processing {
+                    server.is_processing = true;
+
+                    if let Some(request) = server.remove_request() {
+                        let server_id = server.id;
+                        let event_tx = event_tx.clone();
+
+                        tokio::spawn(async move {
+                            tokio::time::sleep(Duration::from_millis(request.get_time())).await;
+
+                            event_tx
+                                .send(SystemEvent::RequestProcessed {
+                                    request_id: request.id,
+                                    server_id,
+                                })
+                                .await
+                                .ok();
+                        });
+                    }
+                }
+            }
+
+            ticker.tick().await;
+        }
+    })
 }
