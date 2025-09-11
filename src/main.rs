@@ -2,6 +2,8 @@ mod display;
 mod request;
 mod server;
 
+use rand::rngs::StdRng;
+use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 use request::Request;
 use std::collections::VecDeque;
@@ -12,17 +14,50 @@ use tokio::time::{Duration, interval};
 use crate::display::run_ui;
 use crate::server::ServerState;
 
+const REQUEST_AVG_RATE: i32 = 3; // requests/second
+pub const PENDING_REQUESTS_LIMIT: i32 = 20;
+
 enum ServerChoiceMode {
     Random,
     RoundRobin { server_num: usize },
     SmallerQueue,
 }
 
-#[derive(Clone, Copy)]
+impl ServerChoiceMode {
+    fn choose(&mut self, server_states: &[ServerState; 3], rng: &mut StdRng) -> Vec<usize> {
+        let indices = match self {
+            ServerChoiceMode::Random => {
+                let mut indices = vec![0, 1, 2];
+                indices.shuffle(rng);
+                indices
+            }
+            ServerChoiceMode::RoundRobin { server_num } => {
+                let start = *server_num;
+                *server_num = (*server_num + 1) % 3;
+                vec![start, (start + 1) % 3, (start + 2) % 3]
+            }
+            ServerChoiceMode::SmallerQueue => {
+                let mut servers_by_load: Vec<(usize, u64)> = server_states
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, state)| (idx, state.total_workload))
+                    .collect();
+
+                servers_by_load.sort_by_key(|(_, workload)| *workload);
+                servers_by_load.into_iter().map(|(idx, _)| idx).collect()
+            }
+        };
+        indices
+    }
+}
+
+#[derive(Clone)]
 enum SystemEvent {
     RequestCreated(Request),
     RequestAssigned { server_id: u64, request: Request },
+    RequestProcessStarted { request_id: usize, server_id: u64 },
     RequestProcessed { request_id: usize, server_id: u64 },
+    ErrorEncountered(String),
 }
 
 pub struct SystemState {
@@ -38,19 +73,18 @@ pub struct SystemStats {
     avg_wait_time: f64,
 }
 
-const REQUEST_AVG_RATE: i32 = 3; // requests/second
-
 #[tokio::main]
 async fn main() {
-    let (main_tx, main_rx) = mpsc::channel::<SystemEvent>(100);
+    let (main_tx, main_rx) = mpsc::channel::<SystemEvent>(1000);
 
-    let (allocator_tx, allocator_rx) = mpsc::channel::<SystemEvent>(100);
-    let (server_tx, server_rx) = mpsc::channel::<SystemEvent>(100);
-    let (ui_tx, ui_rx) = mpsc::channel::<SystemEvent>(100);
+    let (gen_tx, gen_rx) = mpsc::channel::<SystemEvent>(1000);
+    let (allocator_tx, allocator_rx) = mpsc::channel::<SystemEvent>(1000);
+    let (server_tx, server_rx) = mpsc::channel::<SystemEvent>(1000);
+    let (ui_tx, ui_rx) = mpsc::channel::<SystemEvent>(1000);
 
-    let router_handle = spawn_event_router(main_rx, allocator_tx, server_tx, ui_tx);
+    let router_handle = spawn_event_router(main_rx, gen_tx, allocator_tx, server_tx, ui_tx);
 
-    let gen_handle = spawn_request_generator(main_tx.clone());
+    let gen_handle = spawn_request_generator(main_tx.clone(), gen_rx);
     let alloc_handle = spawn_request_allocator(main_tx.clone(), allocator_rx);
     let server_handle = spawn_servers(main_tx.clone(), server_rx);
 
@@ -70,6 +104,7 @@ async fn main() {
 
 fn spawn_event_router(
     mut event_rx: Receiver<SystemEvent>,
+    gen_tx: Sender<SystemEvent>,
     allocator_tx: Sender<SystemEvent>,
     server_tx: Sender<SystemEvent>,
     ui_tx: Sender<SystemEvent>,
@@ -83,6 +118,7 @@ fn spawn_event_router(
                     ui_tx.send(event).await.ok();
                 }
                 SystemEvent::RequestAssigned { .. } => {
+                    gen_tx.send(event.clone()).await.ok();
                     server_tx.send(event.clone()).await.ok();
 
                     ui_tx.send(event).await.ok();
@@ -93,24 +129,45 @@ fn spawn_event_router(
 
                     ui_tx.send(event).await.ok();
                 }
+                SystemEvent::RequestProcessStarted { .. } => {
+                    ui_tx.send(event.clone()).await.ok();
+                }
+                SystemEvent::ErrorEncountered(_) => {
+                    ui_tx.send(event.clone()).await.ok();
+                }
             }
         }
     })
 }
 
-fn spawn_request_generator(event_tx: Sender<SystemEvent>) -> JoinHandle<()> {
+fn spawn_request_generator(
+    event_tx: Sender<SystemEvent>,
+    mut event_rx: Receiver<SystemEvent>,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut rng = rand::rngs::StdRng::from_rng(&mut rand::rng());
         let mut ticker = interval(Duration::from_millis(100));
 
+        let mut pending_requests = 0;
+
         loop {
-            if rng.random_range(0..10) < REQUEST_AVG_RATE {
+            if pending_requests < PENDING_REQUESTS_LIMIT
+                && rng.random_range(0..10) < REQUEST_AVG_RATE
+            {
                 let request = Request::create_random();
 
                 event_tx
                     .send(SystemEvent::RequestCreated(request.clone()))
                     .await
                     .ok();
+
+                pending_requests += 1;
+            }
+
+            while let Ok(event) = event_rx.try_recv() {
+                if let SystemEvent::RequestAssigned { .. } = event {
+                    pending_requests -= 1;
+                }
             }
 
             ticker.tick().await;
@@ -134,6 +191,9 @@ fn spawn_request_allocator(
 
         let mut rng = rand::rngs::StdRng::from_rng(&mut rand::rng());
 
+        let mut consecutive_full_errors = 0;
+        let mut full_server = [false; 3];
+
         loop {
             while let Ok(event) = event_rx.try_recv() {
                 match event {
@@ -154,38 +214,51 @@ fn spawn_request_allocator(
             }
 
             if !requests.is_empty() {
-                let server_idx = match choice_mode {
-                    ServerChoiceMode::Random => rng.random_range(0..3),
-                    ServerChoiceMode::RoundRobin { ref mut server_num } => {
-                        let idx = *server_num;
-                        *server_num = (*server_num + 1) % 3;
-                        idx
+                let mut assigned = true;
+
+                let server_indices = choice_mode.choose(&server_states, &mut rng);
+
+                for &idx in &server_indices {
+                    let server = &mut server_states[idx];
+
+                    if server.queue.len() < server.queue.capacity() {
+                        let request = requests.pop_front().unwrap();
+                        server.add_request(request.clone());
+
+                        event_tx
+                            .send(SystemEvent::RequestAssigned {
+                                server_id: server.id,
+                                request: request,
+                            })
+                            .await
+                            .ok();
+
+                        assigned = true;
+                        break;
+                    } else {
+                        full_server[idx] = true;
                     }
-                    ServerChoiceMode::SmallerQueue => server_states
-                        .iter()
-                        .enumerate()
-                        .min_by_key(|(_, state)| state.total_workload)
-                        .map(|(idx, _)| idx)
-                        .unwrap_or(0),
-                };
-
-                let server = &mut server_states[server_idx];
-
-                if server.queue.len() >= server.queue.capacity() {
-                    continue;
                 }
 
-                let request = requests.pop_front().unwrap();
+                if !assigned && full_server == [true; 3] {
+                    consecutive_full_errors += 1;
 
-                server.add_request(request.clone());
+                    if consecutive_full_errors % 10 == 1 {
+                        event_tx
+                            .send(SystemEvent::ErrorEncountered(format!(
+                                "All servers are full",
+                            )))
+                            .await
+                            .ok();
+                    }
 
-                event_tx
-                    .send(SystemEvent::RequestAssigned {
-                        server_id: server.id,
-                        request: request,
-                    })
-                    .await
-                    .ok();
+                    if consecutive_full_errors > 5 {
+                        tokio::time::sleep(Duration::from_millis(
+                            50 * consecutive_full_errors.min(20),
+                        ))
+                        .await;
+                    }
+                }
             }
 
             ticker.tick().await;
@@ -234,13 +307,20 @@ fn spawn_servers(
 
             for server in &mut servers {
                 if !server.queue.is_empty() && !server.is_processing {
-                    server.is_processing = true;
-
                     if let Some(request) = server.remove_request() {
+                        server.is_processing = true;
                         let server_id = server.id;
                         let event_tx = event_tx.clone();
 
                         tokio::spawn(async move {
+                            event_tx
+                                .send(SystemEvent::RequestProcessStarted {
+                                    request_id: request.id,
+                                    server_id: server_id,
+                                })
+                                .await
+                                .ok();
+
                             tokio::time::sleep(Duration::from_millis(request.get_time())).await;
 
                             event_tx
