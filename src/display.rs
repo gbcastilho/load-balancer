@@ -1,4 +1,7 @@
-use crate::{SystemEvent, SystemState, SystemStats, request::Request, server::ServerState};
+use crate::{
+    PENDING_REQUESTS_LIMIT, SystemEvent, SystemState, SystemStats, request::Request,
+    server::ServerState,
+};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::{
     Frame, Terminal, backend,
@@ -10,12 +13,55 @@ use ratatui::{
 };
 use std::{
     collections::VecDeque,
-    io, thread,
+    io,
+    sync::atomic::{AtomicUsize, Ordering},
+    thread,
     time::{Duration, Instant},
 };
 use tokio::sync::mpsc::Receiver;
 
-static mut SELECTED_LOG: usize = 0;
+struct AtomicRect {
+    x: AtomicUsize,
+    y: AtomicUsize,
+    width: AtomicUsize,
+    height: AtomicUsize,
+}
+
+impl AtomicRect {
+    const fn new() -> Self {
+        Self {
+            x: AtomicUsize::new(0),
+            y: AtomicUsize::new(0),
+            width: AtomicUsize::new(0),
+            height: AtomicUsize::new(0),
+        }
+    }
+
+    fn update_from(&self, rect: Rect) {
+        self.x.store(rect.x as usize, Ordering::SeqCst);
+        self.y.store(rect.y as usize, Ordering::SeqCst);
+        self.width.store(rect.width as usize, Ordering::SeqCst);
+        self.height.store(rect.height as usize, Ordering::SeqCst);
+    }
+
+    fn contains(&self, x: u16, y: u16) -> bool {
+        let self_x = self.x.load(Ordering::SeqCst) as u16;
+        let self_y = self.y.load(Ordering::SeqCst) as u16;
+        let self_width = self.width.load(Ordering::SeqCst) as u16;
+        let self_height = self.height.load(Ordering::SeqCst) as u16;
+
+        x >= self_x && x < self_x + self_width && y >= self_y && y < self_y + self_height
+    }
+}
+
+static SELECTED_LOG: AtomicUsize = AtomicUsize::new(0);
+
+static SERVER_AREAS: [AtomicRect; 3] = [AtomicRect::new(), AtomicRect::new(), AtomicRect::new()];
+static SERVER_SCROLL: [AtomicUsize; 3] = [
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+];
 
 pub fn run_ui(mut ui_rx: Receiver<SystemEvent>) -> io::Result<()> {
     let mut terminal = init_terminal()?;
@@ -109,6 +155,18 @@ fn update_system_state(state: &mut SystemState, event: SystemEvent) {
                 );
             }
         }
+        SystemEvent::RequestProcessStarted {
+            request_id,
+            server_id,
+        } => {
+            add_log(
+                &mut state.logs,
+                format!(
+                    "Server {} started processing Request #{}",
+                    server_id, request_id
+                ),
+            );
+        }
         SystemEvent::RequestProcessed {
             request_id,
             server_id,
@@ -125,6 +183,9 @@ fn update_system_state(state: &mut SystemState, event: SystemEvent) {
                     format!("Server {} processed request #{}", server_id, request_id),
                 );
             }
+        }
+        SystemEvent::ErrorEncountered(error_msg) => {
+            add_log(&mut state.logs, format!("Error: {error_msg}"));
         }
     }
 }
@@ -162,7 +223,12 @@ fn render_system_ui(frame: &mut Frame, state: &SystemState) {
 }
 
 fn render_requests(frame: &mut Frame, area: Rect, requests: &VecDeque<Request>) {
-    let block = Block::bordered().title("Pending Requests");
+    let style = if requests.len() >= PENDING_REQUESTS_LIMIT as usize {
+        Style::default().fg(style::Color::Red)
+    } else {
+        Style::default()
+    };
+    let block = Block::bordered().title("Pending Requests").style(style);
     let inner_area = block.inner(area);
 
     frame.render_widget(block, area);
@@ -193,21 +259,42 @@ fn render_requests(frame: &mut Frame, area: Rect, requests: &VecDeque<Request>) 
 fn render_servers(frame: &mut Frame, area: Rect, servers: &[ServerState; 3]) {
     let servers_layout = Layout::horizontal([Constraint::Fill(1); 3]).split(area);
 
+    for i in 0..3 {
+        SERVER_AREAS[i].update_from(servers_layout[i]);
+    }
+
     for (idx, server) in servers.iter().enumerate() {
-        let server_block = Block::bordered().title(format!(
-            "Server {} (Load {}ms)",
-            server.id, server.total_workload
-        ));
+        let style = if server.queue.len() >= server.queue.capacity() {
+            Style::default().fg(style::Color::Red)
+        } else {
+            Style::default()
+        };
+
+        let server_block = Block::bordered()
+            .title(format!(
+                "Server {} (Load {}ms)",
+                server.id, server.total_workload
+            ))
+            .style(style);
 
         let inner_area = server_block.inner(servers_layout[idx]);
 
         frame.render_widget(server_block, servers_layout[idx]);
 
         if !server.queue.is_empty() {
-            let req_layout =
-                Layout::vertical(vec![Constraint::Length(3); server.queue.len()]).split(inner_area);
+            let visible_height = inner_area.height as usize / 3; // Each item is 3 rows tall
+            let visible_items = visible_height.max(1);
 
-            for (req_idx, request) in server.queue.iter().enumerate() {
+            let scroll_pos = SERVER_SCROLL[idx]
+                .load(Ordering::SeqCst)
+                .min(server.queue.len().saturating_sub(visible_items));
+
+            let visible_requests = server.queue.iter().skip(scroll_pos).take(visible_items);
+
+            let req_layout =
+                Layout::vertical(vec![Constraint::Length(3); visible_items]).split(inner_area);
+
+            for (req_idx, request) in visible_requests.enumerate() {
                 let style = if req_idx == 0 && server.is_processing {
                     Style::default().fg(style::Color::Green)
                 } else {
@@ -262,43 +349,67 @@ fn render_logs(frame: &mut Frame, area: Rect, logs: &Vec<String>) {
             .collect();
 
         let max_scroll = items.len().saturating_sub(1);
-        unsafe {
-            SELECTED_LOG = SELECTED_LOG.min(max_scroll);
-        }
+        let current_log = SELECTED_LOG.load(Ordering::SeqCst);
+        SELECTED_LOG.store(current_log.min(max_scroll), Ordering::SeqCst);
 
         let logs_list = List::new(items)
             .block(Block::default())
             .highlight_style(Style::default().add_modifier(style::Modifier::REVERSED));
 
         let mut state = ListState::default();
-        unsafe {
-            state.select(Some(SELECTED_LOG));
-        }
+        state.select(Some(SELECTED_LOG.load(Ordering::SeqCst)));
 
         frame.render_stateful_widget(logs_list, inner_area, &mut state);
     }
 }
 
 fn handle_events() -> io::Result<bool> {
-    static mut SCROLL_POSITION: usize = 0;
-
     if event::poll(Duration::from_millis(100))? {
         match event::read()? {
             Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
                 KeyCode::Char('q') => return Ok(true),
                 _ => {}
             },
-            Event::Mouse(mouse) => match mouse.kind {
-                crossterm::event::MouseEventKind::ScrollUp => unsafe {
-                    SCROLL_POSITION = SCROLL_POSITION.saturating_add(1);
-                    SELECTED_LOG = SCROLL_POSITION;
-                },
-                crossterm::event::MouseEventKind::ScrollDown => unsafe {
-                    SCROLL_POSITION = SCROLL_POSITION.saturating_sub(1);
-                    SELECTED_LOG = SCROLL_POSITION;
-                },
-                _ => {}
-            },
+            Event::Mouse(mouse) => {
+                let position = (mouse.column, mouse.row);
+
+                match mouse.kind {
+                    crossterm::event::MouseEventKind::ScrollUp
+                    | crossterm::event::MouseEventKind::ScrollDown => {
+                        let is_scrolling_up =
+                            matches!(mouse.kind, crossterm::event::MouseEventKind::ScrollUp);
+
+                        let mut hit_server = None;
+                        {
+                            for idx in 0..3 {
+                                if SERVER_AREAS[idx].contains(position.0, position.1) {
+                                    hit_server = Some(idx);
+                                    break;
+                                }
+                            }
+
+                            if let Some(idx) = hit_server {
+                                let current = SERVER_SCROLL[idx].load(Ordering::SeqCst);
+                                if is_scrolling_up {
+                                    SERVER_SCROLL[idx]
+                                        .store(current.saturating_add(1), Ordering::SeqCst);
+                                } else {
+                                    SERVER_SCROLL[idx]
+                                        .store(current.saturating_sub(1), Ordering::SeqCst);
+                                }
+                            } else {
+                                let current = SELECTED_LOG.load(Ordering::SeqCst);
+                                if is_scrolling_up {
+                                    SELECTED_LOG.store(current.saturating_add(1), Ordering::SeqCst);
+                                } else {
+                                    SELECTED_LOG.store(current.saturating_sub(1), Ordering::SeqCst);
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
             _ => {}
         }
     }
