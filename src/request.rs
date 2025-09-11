@@ -1,9 +1,4 @@
-use std::{fmt::Debug, time::Duration};
-
 use rand::Rng;
-use tokio::time::{self, sleep};
-
-use crate::display::log_debug;
 
 #[derive(Debug, Clone, Copy)]
 pub enum RequestSize {
@@ -47,12 +42,11 @@ impl RequestType {
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct Request {
     pub id: usize,
     pub kind: RequestType,
     pub size: RequestSize,
-    pub arrived_at: time::Instant,
-    pub finished_at: Option<time::Instant>,
 }
 
 impl Request {
@@ -80,22 +74,6 @@ impl Request {
             id: rng.random_range(1000000..10000000),
             kind: REQ_TYPES[rng.random_range(0..REQ_TYPES.len())],
             size: REQ_SIZES[rng.random_range(0..REQ_SIZES.len())],
-            arrived_at: time::Instant::now(),
-            finished_at: None,
-        }
-    }
-}
-
-pub struct Server {
-    pub id: u64,
-    pub queue: std::collections::VecDeque<Request>,
-}
-
-impl Server {
-    pub async fn process_request(&mut self) {
-        if let Some(request) = self.queue.pop_front() {
-            sleep(Duration::from_millis(request.get_time())).await;
-            log_debug(format!("Server {} processed #{}", self.id, request.id));
         }
     }
 }
