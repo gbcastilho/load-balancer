@@ -161,10 +161,7 @@ fn update_system_state(state: &mut SystemState, event: SystemEvent) {
         } => {
             add_log(
                 &mut state.logs,
-                format!(
-                    "Server {} started processing Request #{}",
-                    server_id, request_id
-                ),
+                format!("Server {} started at Request #{}", server_id, request_id),
             );
         }
         SystemEvent::RequestProcessed {
@@ -180,7 +177,7 @@ fn update_system_state(state: &mut SystemState, event: SystemEvent) {
 
                 add_log(
                     &mut state.logs,
-                    format!("Server {} processed request #{}", server_id, request_id),
+                    format!("Server {} processed Request #{}", server_id, request_id),
                 );
             }
         }
