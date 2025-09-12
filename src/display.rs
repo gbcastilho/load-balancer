@@ -67,6 +67,10 @@ pub fn run_ui(mut ui_rx: Receiver<SystemEvent>) -> io::Result<()> {
     let mut terminal = init_terminal()?;
 
     let mut system_state = SystemState {
+        configs: SystemConfig {
+            arrival_rate: 3.0,
+            choice_mode: crate::ServerChoiceMode::Random,
+        },
         pending_requests: VecDeque::new(),
         servers: [
             ServerState::new(1),
@@ -78,6 +82,8 @@ pub fn run_ui(mut ui_rx: Receiver<SystemEvent>) -> io::Result<()> {
             total_requests: 0,
             processed_requests: 0,
             avg_wait_time: 0.0,
+            throughput: 0.0,
+            throughput_window: Vec::with_capacity(30),
         },
     };
 
@@ -167,6 +173,7 @@ fn update_system_state(state: &mut SystemState, event: SystemEvent) {
         SystemEvent::RequestProcessed {
             request_id,
             server_id,
+            created_at,
         } => {
             let server_idx = (server_id - 1) as usize;
             if server_idx < state.servers.len() {
@@ -174,6 +181,35 @@ fn update_system_state(state: &mut SystemState, event: SystemEvent) {
                 server.remove_request();
 
                 state.stats.processed_requests += 1;
+
+                let now = Instant::now();
+                state.stats.throughput_window.push(now);
+
+                let cutoff = now - Duration::from_secs(10);
+                state
+                    .stats
+                    .throughput_window
+                    .retain(|timestamp| *timestamp >= cutoff);
+
+                let total_in_window = state.stats.throughput_window.len();
+                if let Some(oldest) = state.stats.throughput_window.first() {
+                    let window_duration = now.duration_since(*oldest).as_secs_f64();
+                    if window_duration > 0.0 {
+                        state.stats.throughput = total_in_window as f64 / window_duration;
+                    }
+                }
+
+                if created_at != Instant::now() {
+                    let wait_time = now.duration_since(created_at).as_millis() as f64;
+
+                    state.stats.avg_wait_time = if state.stats.processed_requests <= 1 {
+                        wait_time
+                    } else {
+                        (state.stats.avg_wait_time * (state.stats.processed_requests - 1) as f64
+                            + wait_time)
+                            / state.stats.processed_requests as f64
+                    }
+                }
 
                 add_log(
                     &mut state.logs,
@@ -209,9 +245,13 @@ fn render_system_ui(frame: &mut Frame, state: &SystemState) {
             .areas(processing_area);
     let [requests_area, servers_area] = processing_layout;
 
-    let info_layout =
-        Layout::vertical([Constraint::Percentage(30), Constraint::Percentage(70)]).areas(info_area);
-    let [stats_area, logs_area] = info_layout;
+    let info_layout = Layout::vertical([
+        Constraint::Length(4),
+        Constraint::Fill(1),
+        Constraint::Percentage(70),
+    ])
+    .areas(info_area);
+    let [configs_area, stats_area, logs_area] = info_layout;
 
     render_requests(frame, requests_area, &state.pending_requests);
     render_servers(frame, servers_area, &state.servers);
@@ -341,6 +381,24 @@ fn first_req_style(idx: usize) -> Style {
     }
 }
 
+fn render_configs(frame: &mut Frame, area: Rect, config: &SystemConfig) {
+    let block = Block::bordered().title("Configs");
+    let inner_area = block.inner(area);
+
+    frame.render_widget(block, area);
+
+    let stats_text = text::Text::from(vec![
+        text::Line::from(format!("[⮜ ⮞] Policy: {}", config.choice_mode)),
+        text::Line::from(format!(
+            "[⮝ ⮟] Arrival Rate (λ): {:.1} req/sec",
+            config.arrival_rate
+        )),
+    ]);
+
+    let stats_widget = Paragraph::new(stats_text);
+    frame.render_widget(stats_widget, inner_area);
+}
+
 fn render_stats(frame: &mut Frame, area: Rect, stats: &SystemStats) {
     let block = Block::bordered().title("Statistics");
     let inner_area = block.inner(area);
@@ -350,7 +408,11 @@ fn render_stats(frame: &mut Frame, area: Rect, stats: &SystemStats) {
     let stats_text = text::Text::from(vec![
         text::Line::from(format!("Total Requests: {}", stats.total_requests)),
         text::Line::from(format!("Processed: {}", stats.processed_requests)),
-        text::Line::from(format!("Average Wait: {:.1}ms", stats.avg_wait_time)),
+        text::Line::from(format!(
+            "Average Response Time: {:.1}ms",
+            stats.avg_wait_time
+        )),
+        text::Line::from(format!("Throughput: {:.2} req/sec", stats.throughput)),
     ]);
 
     let stats_widget = Paragraph::new(stats_text);

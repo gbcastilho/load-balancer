@@ -7,6 +7,8 @@ use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 use request::Request;
 use std::collections::VecDeque;
+use std::fmt;
+use std::time::Instant;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, interval};
@@ -21,6 +23,16 @@ enum ServerChoiceMode {
     Random,
     RoundRobin { server_num: usize },
     SmallerQueue,
+}
+
+impl fmt::Display for ServerChoiceMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Random => write!(f, "Random"),
+            Self::RoundRobin { .. } => write!(f, "Round Robin"),
+            Self::SmallerQueue => write!(f, "Smaller Queue"),
+        }
+    }
 }
 
 impl ServerChoiceMode {
@@ -51,12 +63,27 @@ impl ServerChoiceMode {
     }
 }
 
+struct SystemConfig {
+    arrival_rate: f32,
+    choice_mode: ServerChoiceMode,
+}
+
 #[derive(Clone)]
 enum SystemEvent {
     RequestCreated(Request),
-    RequestAssigned { server_id: u64, request: Request },
-    RequestProcessStarted { request_id: usize, server_id: u64 },
-    RequestProcessed { request_id: usize, server_id: u64 },
+    RequestAssigned {
+        server_id: u64,
+        request: Request,
+    },
+    RequestProcessStarted {
+        request_id: usize,
+        server_id: u64,
+    },
+    RequestProcessed {
+        request_id: usize,
+        server_id: u64,
+        created_at: Instant,
+    },
     ErrorEncountered(String),
 }
 
@@ -64,6 +91,7 @@ pub struct SystemState {
     pending_requests: VecDeque<Request>,
     servers: [ServerState; 3],
     logs: Vec<String>,
+    configs: SystemConfig,
     stats: SystemStats,
 }
 
@@ -71,6 +99,8 @@ pub struct SystemStats {
     total_requests: usize,
     processed_requests: usize,
     avg_wait_time: f64,
+    throughput: f64,
+    throughput_window: Vec<Instant>,
 }
 
 #[tokio::main]
@@ -203,6 +233,7 @@ fn spawn_request_allocator(
                     SystemEvent::RequestProcessed {
                         request_id: _,
                         server_id,
+                        created_at: _,
                     } => {
                         let server_idx = (server_id - 1) as usize;
 
@@ -293,6 +324,7 @@ fn spawn_servers(
                     SystemEvent::RequestProcessed {
                         request_id: _,
                         server_id,
+                        created_at: _,
                     } => {
                         let server_idx = (server_id - 1) as usize;
                         if server_idx < servers.len() {
@@ -325,8 +357,9 @@ fn spawn_servers(
 
                             event_tx
                                 .send(SystemEvent::RequestProcessed {
-                                    request_id: request.id,
                                     server_id,
+                                    request_id: request.id,
+                                    created_at: request.created_at,
                                 })
                                 .await
                                 .ok();
