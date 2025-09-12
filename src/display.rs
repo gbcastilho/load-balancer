@@ -235,23 +235,49 @@ fn render_requests(frame: &mut Frame, area: Rect, requests: &VecDeque<Request>) 
 
     if !requests.is_empty() {
         let req_width = 21;
+        let req_height = 4;
+
         let requests_per_row = (inner_area.width as usize / req_width).max(1);
+        let rows_available = (inner_area.width as usize / req_height).max(1);
 
-        let req_layout = Layout::horizontal(vec![
-            Constraint::Length(20);
-            requests.len().min(requests_per_row)
-        ])
-        .split(inner_area);
+        let mut constraints_h = Vec::new();
+        let mut constraints_v = Vec::new();
 
-        for (idx, request) in requests.iter().enumerate().take(requests_per_row) {
-            let req_block = Block::bordered();
-            frame.render_widget(req_block.clone(), req_layout[idx]);
+        for _ in 0..requests_per_row {
+            constraints_h.push(Constraint::Length(req_width as u16));
+        }
+        for _ in 0..requests_per_row {
+            constraints_v.push(Constraint::Length(req_height as u16));
+        }
 
-            let inner_req_area = req_block.inner(req_layout[idx]);
-            let req_text = Paragraph::new(format!("{}\n(#{})", request.get_name(), request.id))
-                .alignment(layout::Alignment::Center);
+        let mut request_idx = 0;
+        for row in 0..rows_available {
+            if request_idx >= requests.len() {
+                break;
+            }
 
-            frame.render_widget(req_text, inner_req_area);
+            for col in 0..requests_per_row {
+                if request_idx >= requests.len() {
+                    break;
+                }
+
+                let request = &requests[request_idx];
+
+                let cell_x = (col * req_width) as u16 + inner_area.x;
+                let cell_y = (row * req_height) as u16 + inner_area.y;
+                let cell_area = Rect::new(cell_x, cell_y, req_width as u16, req_height as u16);
+
+                let req_block = Block::bordered().style(first_req_style(request_idx));
+                frame.render_widget(req_block.clone(), cell_area);
+
+                let inner_req_area = req_block.inner(cell_area);
+                let req_text = Paragraph::new(format!("{}\n(#{})", request.get_name(), request.id))
+                    .alignment(layout::Alignment::Center);
+
+                frame.render_widget(req_text, inner_req_area);
+
+                request_idx += 1;
+            }
         }
     }
 }
@@ -295,27 +321,26 @@ fn render_servers(frame: &mut Frame, area: Rect, servers: &[ServerState; 3]) {
                 Layout::vertical(vec![Constraint::Length(3); visible_items]).split(inner_area);
 
             for (req_idx, request) in visible_requests.enumerate() {
-                let style = if req_idx == 0 && server.is_processing {
-                    Style::default().fg(style::Color::Green)
-                } else {
-                    Style::default()
-                };
-
-                let req_text = Paragraph::new(text::Line::styled(
-                    format!(
-                        "{} (#{}) - {}ms",
-                        request.get_name(),
-                        request.id,
-                        request.get_time()
-                    ),
-                    style,
-                ))
+                let req_text = Paragraph::new(text::Line::raw(format!(
+                    "{} (#{}) - {}ms",
+                    request.get_name(),
+                    request.id,
+                    request.get_time()
+                )))
                 .alignment(layout::Alignment::Center)
-                .block(Block::bordered());
+                .block(Block::bordered().style(first_req_style(req_idx)));
 
                 frame.render_widget(req_text, req_layout[req_idx]);
             }
         }
+    }
+}
+
+fn first_req_style(idx: usize) -> Style {
+    if idx == 0 {
+        Style::default().fg(style::Color::Green)
+    } else {
+        Style::default()
     }
 }
 
