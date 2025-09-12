@@ -12,9 +12,9 @@ pub enum RequestSize {
 impl RequestSize {
     fn mult_factor(&self) -> u64 {
         match self {
-            RequestSize::Small => 5,
-            RequestSize::Mid => 10,
-            RequestSize::Large => 50,
+            RequestSize::Small => 1,
+            RequestSize::Mid => 3,
+            RequestSize::Large => 10,
         }
     }
 }
