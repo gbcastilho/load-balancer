@@ -1,6 +1,6 @@
 use crate::{
-    PENDING_REQUESTS_LIMIT, SystemEvent, SystemState, SystemStats, request::Request,
-    server::ServerState,
+    PENDING_REQUESTS_LIMIT, ServerChoiceMode, SystemConfig, SystemEvent, SystemState, SystemStats,
+    request::Request, server::ServerState,
 };
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::{
@@ -18,7 +18,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use tokio::sync::mpsc::Receiver;
+use tokio::sync::mpsc::{Receiver, Sender};
 
 struct AtomicRect {
     x: AtomicUsize,
@@ -63,7 +63,7 @@ static SERVER_SCROLL: [AtomicUsize; 3] = [
     AtomicUsize::new(0),
 ];
 
-pub fn run_ui(mut ui_rx: Receiver<SystemEvent>) -> io::Result<()> {
+pub fn run_ui(event_tx: Sender<SystemEvent>, mut ui_rx: Receiver<SystemEvent>) -> io::Result<()> {
     let mut terminal = init_terminal()?;
 
     let mut system_state = SystemState {
@@ -105,7 +105,7 @@ pub fn run_ui(mut ui_rx: Receiver<SystemEvent>) -> io::Result<()> {
             render_system_ui(frame, &system_state);
         })?;
 
-        if handle_events()? {
+        if handle_events(&event_tx, &system_state)? {
             break;
         }
     }
@@ -220,6 +220,17 @@ fn update_system_state(state: &mut SystemState, event: SystemEvent) {
         SystemEvent::ErrorEncountered(error_msg) => {
             add_log(&mut state.logs, format!("Error: {error_msg}"));
         }
+        SystemEvent::ConfigChanged {
+            arrival_rate,
+            choice_mode,
+        } => {
+            if let Some(arrival_rate) = arrival_rate {
+                state.configs.arrival_rate = arrival_rate;
+            }
+            if let Some(choice_mode) = choice_mode {
+                state.configs.choice_mode = choice_mode;
+            }
+        }
     }
 }
 
@@ -246,15 +257,16 @@ fn render_system_ui(frame: &mut Frame, state: &SystemState) {
     let [requests_area, servers_area] = processing_layout;
 
     let info_layout = Layout::vertical([
-        Constraint::Length(4),
+        Constraint::Length(5),
+        Constraint::Length(6),
         Constraint::Fill(1),
-        Constraint::Percentage(70),
     ])
     .areas(info_area);
     let [configs_area, stats_area, logs_area] = info_layout;
 
     render_requests(frame, requests_area, &state.pending_requests);
     render_servers(frame, servers_area, &state.servers);
+    render_configs(frame, configs_area, &state.configs);
     render_stats(frame, stats_area, &state.stats);
     render_logs(frame, logs_area, &state.logs);
 }
@@ -388,11 +400,12 @@ fn render_configs(frame: &mut Frame, area: Rect, config: &SystemConfig) {
     frame.render_widget(block, area);
 
     let stats_text = text::Text::from(vec![
-        text::Line::from(format!("[⮜ ⮞] Policy: {}", config.choice_mode)),
+        text::Line::from(format!("⮜ ⮞ Policy: {}", config.choice_mode)),
         text::Line::from(format!(
-            "[⮝ ⮟] Arrival Rate (λ): {:.1} req/sec",
+            "⮝ ⮟ Arrival Rate (λ): {:.1} req/sec",
             config.arrival_rate
         )),
+        text::Line::from(format!("[Q] Quit")),
     ]);
 
     let stats_widget = Paragraph::new(stats_text);
@@ -447,11 +460,61 @@ fn render_logs(frame: &mut Frame, area: Rect, logs: &Vec<String>) {
     }
 }
 
-fn handle_events() -> io::Result<bool> {
+fn handle_events(event_tx: &Sender<SystemEvent>, state: &SystemState) -> io::Result<bool> {
     if event::poll(Duration::from_millis(100))? {
         match event::read()? {
             Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
                 KeyCode::Char('q') => return Ok(true),
+                KeyCode::Left => {
+                    let new_mode = match state.configs.choice_mode {
+                        ServerChoiceMode::Random => ServerChoiceMode::RoundRobin { server_num: 0 },
+                        ServerChoiceMode::RoundRobin { .. } => ServerChoiceMode::SmallerQueue,
+                        ServerChoiceMode::SmallerQueue => ServerChoiceMode::Random,
+                    };
+
+                    event_tx
+                        .try_send(SystemEvent::ConfigChanged {
+                            arrival_rate: None,
+                            choice_mode: Some(new_mode),
+                        })
+                        .ok();
+                }
+                KeyCode::Right => {
+                    let new_mode = match state.configs.choice_mode {
+                        ServerChoiceMode::Random => ServerChoiceMode::SmallerQueue,
+                        ServerChoiceMode::RoundRobin { .. } => ServerChoiceMode::Random,
+                        ServerChoiceMode::SmallerQueue => {
+                            ServerChoiceMode::RoundRobin { server_num: 0 }
+                        }
+                    };
+
+                    event_tx
+                        .try_send(SystemEvent::ConfigChanged {
+                            arrival_rate: None,
+                            choice_mode: Some(new_mode),
+                        })
+                        .ok();
+                }
+                KeyCode::Up => {
+                    let new_rate = (state.configs.arrival_rate + 0.5).min(10.0);
+
+                    event_tx
+                        .try_send(SystemEvent::ConfigChanged {
+                            arrival_rate: Some(new_rate),
+                            choice_mode: None,
+                        })
+                        .ok();
+                }
+                KeyCode::Down => {
+                    let new_rate = (state.configs.arrival_rate - 0.5).max(0.0);
+
+                    event_tx
+                        .try_send(SystemEvent::ConfigChanged {
+                            arrival_rate: Some(new_rate),
+                            choice_mode: None,
+                        })
+                        .ok();
+                }
                 _ => {}
             },
             Event::Mouse(mouse) => {

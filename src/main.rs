@@ -16,9 +16,10 @@ use tokio::time::{Duration, interval};
 use crate::display::run_ui;
 use crate::server::ServerState;
 
-const REQUEST_AVG_RATE: i32 = 3; // requests/second
+const INITIAL_AVG_RATE: i32 = 3; // requests/second
 pub const PENDING_REQUESTS_LIMIT: i32 = 20;
 
+#[derive(Clone)]
 enum ServerChoiceMode {
     Random,
     RoundRobin { server_num: usize },
@@ -85,6 +86,10 @@ enum SystemEvent {
         created_at: Instant,
     },
     ErrorEncountered(String),
+    ConfigChanged {
+        arrival_rate: Option<f32>,
+        choice_mode: Option<ServerChoiceMode>,
+    },
 }
 
 pub struct SystemState {
@@ -119,7 +124,7 @@ async fn main() {
     let server_handle = spawn_servers(main_tx.clone(), server_rx);
 
     let ui_handle = tokio::task::spawn_blocking(move || {
-        if let Err(e) = run_ui(ui_rx) {
+        if let Err(e) = run_ui(main_tx.clone(), ui_rx) {
             eprintln!("UI error: {}", e);
         }
     });
@@ -165,6 +170,12 @@ fn spawn_event_router(
                 SystemEvent::ErrorEncountered(_) => {
                     ui_tx.send(event.clone()).await.ok();
                 }
+                SystemEvent::ConfigChanged { .. } => {
+                    gen_tx.send(event.clone()).await.ok();
+                    allocator_tx.send(event.clone()).await.ok();
+
+                    ui_tx.send(event.clone()).await.ok();
+                }
             }
         }
     })
@@ -175,6 +186,8 @@ fn spawn_request_generator(
     mut event_rx: Receiver<SystemEvent>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        let mut arrival_rate = INITIAL_AVG_RATE as f32;
+
         let mut rng = rand::rngs::StdRng::from_rng(&mut rand::rng());
         let mut ticker = interval(Duration::from_millis(100));
 
@@ -182,7 +195,7 @@ fn spawn_request_generator(
 
         loop {
             if pending_requests < PENDING_REQUESTS_LIMIT
-                && rng.random_range(0..10) < REQUEST_AVG_RATE
+                && rng.random_range(0.0..10.0) < arrival_rate
             {
                 let request = Request::create_random();
 
@@ -195,8 +208,15 @@ fn spawn_request_generator(
             }
 
             while let Ok(event) = event_rx.try_recv() {
-                if let SystemEvent::RequestAssigned { .. } = event {
-                    pending_requests -= 1;
+                match event {
+                    SystemEvent::RequestAssigned { .. } => {
+                        pending_requests -= 1;
+                    }
+                    SystemEvent::ConfigChanged {
+                        arrival_rate: Some(new_rate),
+                        ..
+                    } => arrival_rate = new_rate,
+                    _ => {}
                 }
             }
 
@@ -240,6 +260,10 @@ fn spawn_request_allocator(
                         server_states[server_idx].remove_request();
                         server_states[server_idx].is_processing = false;
                     }
+                    SystemEvent::ConfigChanged {
+                        choice_mode: Some(new_mode),
+                        ..
+                    } => choice_mode = new_mode,
                     _ => {}
                 }
             }

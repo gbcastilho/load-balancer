@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use rand::Rng;
 
 #[derive(Debug, Clone, Copy)]
@@ -41,12 +43,12 @@ impl RequestType {
         }
     }
 }
-
 #[derive(Clone, Copy)]
 pub struct Request {
     pub id: usize,
     pub kind: RequestType,
     pub size: RequestSize,
+    pub created_at: Instant,
 }
 
 impl Request {
@@ -74,6 +76,7 @@ impl Request {
             id: rng.random_range(1000000..10000000),
             kind: REQ_TYPES[rng.random_range(0..REQ_TYPES.len())],
             size: REQ_SIZES[rng.random_range(0..REQ_SIZES.len())],
+            created_at: Instant::now(),
         }
     }
 }
