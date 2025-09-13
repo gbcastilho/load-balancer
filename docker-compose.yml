@@ -1,0 +1,7 @@
+services:
+  load-balancer:
+    build: .
+    tty: true
+    stdin_open: true
+    environment:
+      - TERM=xterm-256color
