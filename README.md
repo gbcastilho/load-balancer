@@ -10,6 +10,14 @@
   </a>
 </p>
 
+<p align="center">
+  <a href="#usage">Usage</a> • 
+  <a href="#options">Options</a> •
+  <a href="#requests">Requests</a> • 
+  <a href="#capacity">Capacity</a> • 
+  <a href="#metrics">Metrics</a>
+</p>
+
 ![GIF demo](img/demo.gif)
 
 A load balancer simulator handles arriving requests and distributes them between three independent servers.
@@ -64,13 +72,13 @@ Requests are defined by type and size.
   - **Mid**: `300ms`
   - **Large**: `1000ms`
 
+## Capacity
+Currently, the maximum number of requests that each queue can store is hard-coded. However, you can easily modify this to test new scenarios.
+- **Server (each)**: 10 requests
+- **Pending list**: 20 requests
+
 ## Metrics
 - **Total Requests**: The total number of requests received.
 - **Processed**:  Number of successfully processed requests.
 - **Avarage Response Time**: The average time taken to process a request since its arrival.
 - **Throughput**: Number of requests processed per second.
-
-## Capacity
-Currently, the maximum number of requests that each queue can store is hard-coded. However, you can easily modify this to test new scenarios.
-- **Server (each)**: 10 requests
-- **Pending list**: 20 requests
