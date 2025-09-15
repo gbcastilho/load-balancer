@@ -69,3 +69,8 @@ Requests are defined by type and size.
 - **Processed**:  Number of successfully processed requests.
 - **Avarage Response Time**: The average time taken to process a request since its arrival.
 - **Throughput**: Number of requests processed per second.
+
+## Capacity
+Currently, the maximum number of requests that each queue can store is hard-coded. However, you can easily modify this to test new scenarios.
+- **Server (each)**: 10 requests
+- **Pending list**: 20 requests
